@@ -10,6 +10,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from dotenv import load_dotenv
 from graphiti_core import Graphiti
@@ -23,9 +24,11 @@ from starlette.responses import JSONResponse
 
 from config.schema import GraphitiConfig, ServerConfig
 from models.response_types import (
+    AddMemoryResponse,
     EpisodeSearchResponse,
     ErrorResponse,
     FactSearchResponse,
+    IngestStatusResponse,
     NodeResult,
     NodeSearchResponse,
     StatusResponse,
@@ -34,6 +37,8 @@ from models.response_types import (
 from services.factories import DatabaseDriverFactory, EmbedderFactory, LLMClientFactory
 from services.queue_service import QueueService
 from utils.formatting import format_fact_result
+from utils.node_name_lookup import search_nodes_by_name_fallback
+from utils.transport_security import build_transport_security_settings
 
 # Load .env file from mcp_server directory
 mcp_server_dir = Path(__file__).parent.parent
@@ -92,6 +97,10 @@ logging.getLogger('uvicorn.access').setLevel(logging.WARNING)  # Reduce access l
 logging.getLogger('mcp.server.streamable_http_manager').setLevel(
     logging.WARNING
 )  # Reduce MCP noise
+logging.getLogger('neo4j.notifications').setLevel(logging.WARNING)  # Reduce schema/index noise
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)  # Reduce telemetry retry noise
+logging.getLogger('backoff').setLevel(logging.ERROR)
+logging.getLogger('posthog').setLevel(logging.ERROR)
 
 
 # Patch uvicorn's logging config to use our format
@@ -142,6 +151,83 @@ When searching, use specific queries and consider filtering by group_id for more
 For optimal performance, ensure the database is properly configured and accessible, and valid 
 API keys are provided for any language model operations.
 """
+
+
+def _get_openai_like_base_url(provider_config: Any) -> str | None:
+    """Return a provider base URL if present, without exposing secrets."""
+    if provider_config is None:
+        return None
+
+    return getattr(provider_config, 'api_url', None)
+
+
+def summarize_runtime_config(config: GraphitiConfig) -> dict[str, str | int | None]:
+    """Build a secret-safe runtime summary for startup logs and diagnostics."""
+    llm_provider_config = getattr(config.llm.providers, config.llm.provider, None)
+    embedder_provider_config = getattr(config.embedder.providers, config.embedder.provider, None)
+
+    return {
+        'llm_provider': config.llm.provider,
+        'llm_model': config.llm.model,
+        'llm_base_url': _get_openai_like_base_url(llm_provider_config),
+        'embedder_provider': config.embedder.provider,
+        'embedder_model': config.embedder.model,
+        'embedder_base_url': _get_openai_like_base_url(embedder_provider_config),
+        'embedder_dimensions': config.embedder.dimensions,
+        'database_provider': config.database.provider,
+        'group_id': config.graphiti.group_id,
+        'transport': config.server.transport,
+    }
+
+
+async def verify_embedder_connectivity(
+    config: GraphitiConfig,
+    probe_text: str = 'graphiti startup health check',
+) -> None:
+    """Verify the configured embedder endpoint is reachable before serving requests."""
+    provider = config.embedder.provider.lower()
+    provider_config = getattr(config.embedder.providers, provider, None)
+    base_url = _get_openai_like_base_url(provider_config)
+
+    if provider != 'openai' or not base_url:
+        logger.info(
+            'Skipping embedder connectivity check for provider=%s base_url=%s',
+            config.embedder.provider,
+            base_url,
+        )
+        return
+
+    try:
+        embedder = EmbedderFactory.create(config.embedder)
+        embedding = await embedder.create(probe_text)
+    except Exception as exc:
+        raise RuntimeError(
+            'Embedder connectivity check failed '
+            f'(provider={config.embedder.provider}, model={config.embedder.model}, '
+            f'base_url={base_url}): {exc}'
+        ) from exc
+
+    if not embedding:
+        raise RuntimeError(
+            'Embedder connectivity check returned no embedding data '
+            f'(provider={config.embedder.provider}, model={config.embedder.model}, '
+            f'base_url={base_url})'
+        )
+
+    if len(embedding) != config.embedder.dimensions:
+        raise RuntimeError(
+            'Embedder connectivity check returned an unexpected vector length '
+            f'(provider={config.embedder.provider}, model={config.embedder.model}, '
+            f'base_url={base_url}, expected={config.embedder.dimensions}, got={len(embedding)})'
+        )
+
+    logger.info(
+        'Embedder connectivity check passed: provider=%s model=%s base_url=%s dimensions=%s',
+        config.embedder.provider,
+        config.embedder.model,
+        base_url,
+        len(embedding),
+    )
 
 # MCP server instance
 mcp = FastMCP(
@@ -326,7 +412,7 @@ async def add_memory(
     source: str = 'text',
     source_description: str = '',
     uuid: str | None = None,
-) -> SuccessResponse | ErrorResponse:
+) -> AddMemoryResponse | ErrorResponse:
     """Add an episode to memory. This is the primary way to add information to the graph.
 
     This function returns immediately and processes the episode addition in the background.
@@ -371,6 +457,7 @@ async def add_memory(
         return ErrorResponse(error='Services not initialized')
 
     try:
+        episode_uuid = uuid or str(uuid4())
         # Use the provided group_id or fall back to the default from config
         effective_group_id = group_id or config.graphiti.group_id
 
@@ -385,23 +472,126 @@ async def add_memory(
                 episode_type = EpisodeType.text
 
         # Submit to queue service for async processing
-        await queue_service.add_episode(
+        queue_position = await queue_service.add_episode(
             group_id=effective_group_id,
             name=name,
             content=episode_body,
             source_description=source_description,
             episode_type=episode_type,
             entity_types=graphiti_service.entity_types,
-            uuid=uuid or None,  # Ensure None is passed if uuid is None
+            uuid=episode_uuid,
         )
 
-        return SuccessResponse(
-            message=f"Episode '{name}' queued for processing in group '{effective_group_id}'"
+        return AddMemoryResponse(
+            message=f"Episode '{name}' queued for processing in group '{effective_group_id}'",
+            episode_uuid=episode_uuid,
+            group_id=effective_group_id,
+            queue_position=queue_position,
         )
     except Exception as e:
         error_msg = str(e)
         logger.error(f'Error queuing episode: {error_msg}')
         return ErrorResponse(error=f'Error queuing episode: {error_msg}')
+
+
+def _serialize_timestamp(value) -> str | None:
+    if isinstance(value, str):
+        return value
+    return value.isoformat() if value is not None else None
+
+
+FULLTEXT_INDEX_EXPECTATIONS = {
+    'episode_content': {'content', 'source', 'source_description', 'group_id'},
+    'node_name_and_summary': {'name', 'summary', 'group_id'},
+    'community_name': {'name', 'group_id'},
+    'edge_name_and_fact': {'name', 'fact', 'group_id'},
+}
+
+
+async def _inspect_fulltext_indexes(client: Graphiti) -> dict[str, Any]:
+    driver = client.driver
+    provider = getattr(driver.provider, 'value', str(driver.provider))
+
+    if provider != 'neo4j':
+        return {'status': 'skipped', 'provider': provider, 'reason': 'only implemented for neo4j'}
+
+    try:
+        records, _, _ = await driver.execute_query(
+            'SHOW FULLTEXT INDEXES YIELD name, properties, state RETURN name, properties, state'
+        )
+    except Exception as exc:
+        logger.warning(f'Failed to inspect fulltext indexes: {exc}')
+        return {'status': 'error', 'provider': provider, 'error': str(exc)}
+
+    actual_indexes = {
+        record['name']: {
+            'properties': set(record.get('properties') or []),
+            'state': record.get('state'),
+        }
+        for record in records
+    }
+
+    missing: list[str] = []
+    stale: list[dict[str, Any]] = []
+    for index_name, expected_properties in FULLTEXT_INDEX_EXPECTATIONS.items():
+        actual = actual_indexes.get(index_name)
+        if actual is None:
+            missing.append(index_name)
+            continue
+
+        actual_properties = {str(value) for value in actual['properties']}
+        if actual_properties != expected_properties or actual.get('state') != 'ONLINE':
+            stale.append(
+                {
+                    'name': index_name,
+                    'expected_properties': sorted(expected_properties),
+                    'actual_properties': sorted(actual_properties),
+                    'state': actual.get('state'),
+                }
+            )
+
+    status = 'ok' if not missing and not stale else 'drift'
+    return {
+        'status': status,
+        'provider': provider,
+        'missing': missing,
+        'stale': stale,
+        'observed': sorted(actual_indexes),
+    }
+
+
+@mcp.tool()
+async def get_ingest_status(
+    episode_uuid: str,
+    group_id: str | None = None,
+) -> IngestStatusResponse | ErrorResponse:
+    """Return the current ingest lifecycle state for a queued episode."""
+    global queue_service
+
+    if queue_service is None:
+        return ErrorResponse(error='Queue service not initialized')
+
+    status = queue_service.get_episode_status(episode_uuid)
+    if status is None:
+        return ErrorResponse(error=f'No ingest status found for episode UUID {episode_uuid}')
+
+    if group_id is not None and status.group_id != group_id:
+        return ErrorResponse(
+            error=f'Episode UUID {episode_uuid} is tracked under group {status.group_id}, not {group_id}'
+        )
+
+    return IngestStatusResponse(
+        message=f'Ingest state for episode {episode_uuid}: {status.state}',
+        episode_uuid=status.episode_uuid,
+        group_id=status.group_id,
+        state=status.state,
+        queue_depth=queue_service.get_queue_size(status.group_id),
+        queue_position=queue_service.get_queue_position(episode_uuid),
+        queued_at=_serialize_timestamp(status.queued_at) or '',
+        started_at=_serialize_timestamp(status.started_at),
+        processed_at=_serialize_timestamp(status.processed_at),
+        last_error=status.last_error,
+    )
 
 
 @mcp.tool()
@@ -453,6 +643,15 @@ async def search_nodes(
 
         # Extract nodes from results
         nodes = results.nodes[:max_nodes] if results.nodes else []
+
+        if not nodes:
+            nodes = await search_nodes_by_name_fallback(
+                driver=client.driver,
+                query=query,
+                search_filter=search_filters,
+                group_ids=effective_group_ids,
+                limit=max_nodes,
+            )
 
         if not nodes:
             return NodeSearchResponse(message='No relevant nodes found', nodes=[])
@@ -726,7 +925,9 @@ async def get_status() -> StatusResponse:
     global graphiti_service
 
     if graphiti_service is None:
-        return StatusResponse(status='error', message='Graphiti service not initialized')
+        return StatusResponse(
+            status='error', message='Graphiti service not initialized', details=None
+        )
 
     try:
         client = await graphiti_service.get_client()
@@ -740,9 +941,14 @@ async def get_status() -> StatusResponse:
 
         # Use the provider from the service's config, not the global
         provider_name = graphiti_service.config.database.provider
+        index_check = await _inspect_fulltext_indexes(client)
         return StatusResponse(
             status='ok',
             message=f'Graphiti MCP server is running and connected to {provider_name} database',
+            details={
+                'database_provider': provider_name,
+                'index_check': index_check,
+            },
         )
     except Exception as e:
         error_msg = str(e)
@@ -750,6 +956,7 @@ async def get_status() -> StatusResponse:
         return StatusResponse(
             status='error',
             message=f'Graphiti MCP server is running but database connection failed: {error_msg}',
+            details=None,
         )
 
 
@@ -853,11 +1060,23 @@ async def initialize_server() -> ServerConfig:
 
     # Log configuration details
     logger.info('Using configuration:')
-    logger.info(f'  - LLM: {config.llm.provider} / {config.llm.model}')
-    logger.info(f'  - Embedder: {config.embedder.provider} / {config.embedder.model}')
-    logger.info(f'  - Database: {config.database.provider}')
-    logger.info(f'  - Group ID: {config.graphiti.group_id}')
-    logger.info(f'  - Transport: {config.server.transport}')
+    runtime_summary = summarize_runtime_config(config)
+    logger.info(
+        '  - LLM: %s / %s',
+        runtime_summary['llm_provider'],
+        runtime_summary['llm_model'],
+    )
+    logger.info('    base_url: %s', runtime_summary['llm_base_url'])
+    logger.info(
+        '  - Embedder: %s / %s',
+        runtime_summary['embedder_provider'],
+        runtime_summary['embedder_model'],
+    )
+    logger.info('    base_url: %s', runtime_summary['embedder_base_url'])
+    logger.info('    dimensions: %s', runtime_summary['embedder_dimensions'])
+    logger.info('  - Database: %s', runtime_summary['database_provider'])
+    logger.info('  - Group ID: %s', runtime_summary['group_id'])
+    logger.info('  - Transport: %s', runtime_summary['transport'])
 
     # Log graphiti-core version
     try:
@@ -873,6 +1092,9 @@ async def initialize_server() -> ServerConfig:
             logger.info(f'  - Graphiti Core: {graphiti_version}')
         else:
             logger.info('  - Graphiti Core: version unavailable')
+
+    # Fail fast if the configured embedder endpoint is unreachable.
+    await verify_embedder_connectivity(config)
 
     # Handle graph destruction if requested
     if hasattr(config, 'destroy_graph') and config.destroy_graph:
@@ -900,6 +1122,7 @@ async def initialize_server() -> ServerConfig:
         mcp.settings.host = config.server.host
     if config.server.port:
         mcp.settings.port = config.server.port
+    mcp.settings.transport_security = build_transport_security_settings(config.server.host)
 
     # Return MCP configuration for transport
     return config.server

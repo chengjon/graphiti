@@ -5,6 +5,8 @@ from config.schema import (
     EmbedderConfig,
     LLMConfig,
 )
+from services.instrumented_clients import InstrumentedEmbedderClient, InstrumentedLLMClient
+from services.openai_compatible_client import OpenAICompatibleJSONClient
 
 # Try to import FalkorDriver if available
 try:
@@ -50,6 +52,7 @@ except ImportError:
 
 try:
     from graphiti_core.llm_client.anthropic_client import AnthropicClient
+    from anthropic import AsyncAnthropic
 
     HAS_ANTHROPIC = True
 except ImportError:
@@ -121,22 +124,42 @@ class LLMClientFactory:
 
                 llm_config = CoreLLMConfig(
                     api_key=api_key,
+                    base_url=config.providers.openai.api_url,
                     model=config.model,
                     small_model=small_model,
                     temperature=config.temperature,
                     max_tokens=config.max_tokens,
                 )
 
+                base_url = config.providers.openai.api_url or ''
+                use_generic_client = bool(base_url) and not base_url.startswith(
+                    'https://api.openai.com'
+                )
+
+                if use_generic_client:
+                    return InstrumentedLLMClient(
+                        OpenAICompatibleJSONClient(
+                            config=llm_config, max_tokens=config.max_tokens
+                        )
+                    )
+
+                llm_client = None
                 # Check if this is a reasoning model (o1, o3, gpt-5 family)
                 reasoning_prefixes = ('o1', 'o3', 'gpt-5')
                 is_reasoning_model = config.model.startswith(reasoning_prefixes)
 
                 # Only pass reasoning/verbosity parameters for reasoning models (gpt-5 family)
                 if is_reasoning_model:
-                    return OpenAIClient(config=llm_config, reasoning='minimal', verbosity='low')
+                    llm_client = OpenAIClient(
+                        config=llm_config, reasoning='minimal', verbosity='low'
+                    )
                 else:
                     # For non-reasoning models, explicitly pass None to disable these parameters
-                    return OpenAIClient(config=llm_config, reasoning=None, verbosity=None)
+                    llm_client = OpenAIClient(
+                        config=llm_config, reasoning=None, verbosity=None
+                    )
+
+                return InstrumentedLLMClient(llm_client)
 
             case 'azure_openai':
                 if not HAS_AZURE_LLM:
@@ -205,7 +228,16 @@ class LLMClientFactory:
                     temperature=config.temperature,
                     max_tokens=config.max_tokens,
                 )
-                return AnthropicClient(config=llm_config)
+
+                anthropic_client = AsyncAnthropic(
+                    api_key=api_key,
+                    base_url=config.providers.anthropic.api_url,
+                    max_retries=1,
+                )
+
+                return InstrumentedLLMClient(
+                    AnthropicClient(config=llm_config, client=anthropic_client)
+                )
 
             case 'gemini':
                 if not HAS_GEMINI:
@@ -274,7 +306,11 @@ class EmbedderFactory:
                     base_url=config.providers.openai.api_url,  # Support custom endpoints like Ollama
                     embedding_dim=config.dimensions,  # Support custom embedding dimensions
                 )
-                return OpenAIEmbedder(config=embedder_config)
+                return InstrumentedEmbedderClient(
+                    inner=OpenAIEmbedder(config=embedder_config),
+                    model_name=config.model,
+                    dimensions=config.dimensions,
+                )
 
             case 'azure_openai':
                 if not HAS_AZURE_EMBEDDER:
@@ -309,9 +345,13 @@ class EmbedderFactory:
                     api_key=api_key,
                 )
 
-                return AzureOpenAIEmbedderClient(
-                    azure_client=azure_client,
-                    model=config.model or 'text-embedding-3-small',
+                return InstrumentedEmbedderClient(
+                    inner=AzureOpenAIEmbedderClient(
+                        azure_client=azure_client,
+                        model=config.model or 'text-embedding-3-small',
+                    ),
+                    model_name=config.model or 'text-embedding-3-small',
+                    dimensions=config.dimensions or 1536,
                 )
 
             case 'gemini':
@@ -332,7 +372,11 @@ class EmbedderFactory:
                     embedding_model=config.model or 'models/text-embedding-004',
                     embedding_dim=config.dimensions or 768,
                 )
-                return GeminiEmbedder(config=gemini_config)
+                return InstrumentedEmbedderClient(
+                    inner=GeminiEmbedder(config=gemini_config),
+                    model_name=config.model or 'models/text-embedding-004',
+                    dimensions=config.dimensions or 768,
+                )
 
             case 'voyage':
                 if not HAS_VOYAGE_EMBEDDER:
@@ -352,7 +396,11 @@ class EmbedderFactory:
                     embedding_model=config.model or 'voyage-3',
                     embedding_dim=config.dimensions or 1024,
                 )
-                return VoyageAIEmbedder(config=voyage_config)
+                return InstrumentedEmbedderClient(
+                    inner=VoyageAIEmbedder(config=voyage_config),
+                    model_name=config.model or 'voyage-3',
+                    dimensions=config.dimensions or 1024,
+                )
 
             case _:
                 raise ValueError(f'Unsupported Embedder provider: {provider}')
