@@ -229,6 +229,7 @@ async def verify_embedder_connectivity(
         len(embedding),
     )
 
+
 # MCP server instance
 mcp = FastMCP(
     'Graphiti Agent Memory',
@@ -242,6 +243,24 @@ queue_service: QueueService | None = None
 # Global client for backward compatibility
 graphiti_client: Graphiti | None = None
 semaphore: asyncio.Semaphore
+
+
+def _build_queue_service_from_env() -> QueueService:
+    return QueueService(
+        max_retries=int(os.getenv('GRAPHITI_MAX_RETRIES', '2')),
+        retry_base_delay_seconds=float(os.getenv('GRAPHITI_RETRY_BASE_DELAY_SECONDS', '5')),
+        retry_max_delay_seconds=float(os.getenv('GRAPHITI_RETRY_MAX_DELAY_SECONDS', '60')),
+        retry_jitter_seconds=float(os.getenv('GRAPHITI_RETRY_JITTER_SECONDS', '1')),
+        rate_limit_cooldown_base_seconds=float(
+            os.getenv('GRAPHITI_RATE_LIMIT_COOLDOWN_BASE_SECONDS', '15')
+        ),
+        rate_limit_cooldown_max_seconds=float(
+            os.getenv('GRAPHITI_RATE_LIMIT_COOLDOWN_MAX_SECONDS', '180')
+        ),
+        rate_limit_cooldown_jitter_seconds=float(
+            os.getenv('GRAPHITI_RATE_LIMIT_COOLDOWN_JITTER_SECONDS', '3')
+        ),
+    )
 
 
 class GraphitiService:
@@ -591,6 +610,9 @@ async def get_ingest_status(
         started_at=_serialize_timestamp(status.started_at),
         processed_at=_serialize_timestamp(status.processed_at),
         last_error=status.last_error,
+        attempt_count=getattr(status, 'attempt_count', 0),
+        next_retry_at=_serialize_timestamp(getattr(status, 'next_retry_at', None)),
+        last_error_code=getattr(status, 'last_error_code', None),
     )
 
 
@@ -1107,7 +1129,7 @@ async def initialize_server() -> ServerConfig:
 
     # Initialize services
     graphiti_service = GraphitiService(config, SEMAPHORE_LIMIT)
-    queue_service = QueueService()
+    queue_service = _build_queue_service_from_env()
     await graphiti_service.initialize()
 
     # Set global client for backward compatibility

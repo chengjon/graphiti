@@ -56,7 +56,9 @@ async def test_add_memory_returns_episode_tracking_metadata(monkeypatch):
     queue_service = _QueueServiceStub(queue_position=3)
 
     monkeypatch.setattr(server, 'config', config, raising=False)
-    monkeypatch.setattr(server, 'graphiti_service', SimpleNamespace(entity_types=None), raising=False)
+    monkeypatch.setattr(
+        server, 'graphiti_service', SimpleNamespace(entity_types=None), raising=False
+    )
     monkeypatch.setattr(server, 'queue_service', queue_service, raising=False)
 
     response = await server.add_memory(
@@ -78,13 +80,16 @@ async def test_get_ingest_status_returns_current_episode_state(monkeypatch):
     status = SimpleNamespace(
         episode_uuid='episode-1',
         group_id='group-1',
-        state='processing',
+        state='retrying',
         queue_position=None,
         queue_depth=0,
         queued_at='2026-03-20T00:00:00+00:00',
         started_at='2026-03-20T00:00:01+00:00',
         processed_at=None,
-        last_error=None,
+        last_error='Rate limit exceeded',
+        attempt_count=2,
+        next_retry_at='2026-03-20T00:00:05+00:00',
+        last_error_code='rate_limit',
     )
     queue_service = _QueueServiceStub(status=status)
 
@@ -92,10 +97,33 @@ async def test_get_ingest_status_returns_current_episode_state(monkeypatch):
 
     response = await server.get_ingest_status('episode-1', group_id='group-1')
 
-    assert response['state'] == 'processing'
+    assert response['state'] == 'retrying'
     assert response['episode_uuid'] == 'episode-1'
     assert response['group_id'] == 'group-1'
     assert response['started_at'] == '2026-03-20T00:00:01+00:00'
+    assert response['attempt_count'] == 2
+    assert response['next_retry_at'] == '2026-03-20T00:00:05+00:00'
+    assert response['last_error_code'] == 'rate_limit'
+
+
+def test_build_queue_service_from_env_uses_retry_and_cooldown_settings(monkeypatch):
+    monkeypatch.setenv('GRAPHITI_MAX_RETRIES', '4')
+    monkeypatch.setenv('GRAPHITI_RETRY_BASE_DELAY_SECONDS', '15')
+    monkeypatch.setenv('GRAPHITI_RETRY_MAX_DELAY_SECONDS', '180')
+    monkeypatch.setenv('GRAPHITI_RETRY_JITTER_SECONDS', '3')
+    monkeypatch.setenv('GRAPHITI_RATE_LIMIT_COOLDOWN_BASE_SECONDS', '20')
+    monkeypatch.setenv('GRAPHITI_RATE_LIMIT_COOLDOWN_MAX_SECONDS', '240')
+    monkeypatch.setenv('GRAPHITI_RATE_LIMIT_COOLDOWN_JITTER_SECONDS', '5')
+
+    queue_service = server._build_queue_service_from_env()
+
+    assert queue_service._max_retries == 4
+    assert queue_service._retry_base_delay_seconds == 15.0
+    assert queue_service._retry_max_delay_seconds == 180.0
+    assert queue_service._retry_jitter_seconds == 3.0
+    assert queue_service._rate_limit_cooldown_base_seconds == 20.0
+    assert queue_service._rate_limit_cooldown_max_seconds == 240.0
+    assert queue_service._rate_limit_cooldown_jitter_seconds == 5.0
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,9 @@ class IngestStatusResponse(TypedDict):
     started_at: str | None
     processed_at: str | None
     last_error: str | None
+    attempt_count: int
+    next_retry_at: str | None
+    last_error_code: str | None
 
 
 class NodeResult(TypedDict):
