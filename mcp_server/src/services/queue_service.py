@@ -2,11 +2,14 @@
 
 import asyncio
 import logging
+import random
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+
+from graphiti_core.llm_client.errors import RateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,9 @@ class EpisodeIngestStatus:
     processed_at: datetime | None = None
     last_error: str | None = None
     queue_position: int | None = None
+    attempt_count: int = 0
+    next_retry_at: datetime | None = None
+    last_error_code: str | None = None
 
 
 @dataclass
@@ -32,7 +38,17 @@ class _QueuedEpisodeTask:
 class QueueService:
     """Service for managing sequential episode processing queues by group_id."""
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        max_retries: int = 2,
+        retry_base_delay_seconds: float = 5.0,
+        retry_max_delay_seconds: float = 60.0,
+        retry_jitter_seconds: float = 1.0,
+        rate_limit_cooldown_base_seconds: float = 15.0,
+        rate_limit_cooldown_max_seconds: float = 180.0,
+        rate_limit_cooldown_jitter_seconds: float = 3.0,
+    ):
         """Initialize the queue service."""
         # Dictionary to store queues for each group_id
         self._episode_queues: dict[str, asyncio.Queue] = {}
@@ -44,6 +60,88 @@ class QueueService:
         self._episode_statuses: dict[str, EpisodeIngestStatus] = {}
         # Store the graphiti client after initialization
         self._graphiti_client: Any = None
+        self._max_retries = max_retries
+        self._retry_base_delay_seconds = retry_base_delay_seconds
+        self._retry_max_delay_seconds = retry_max_delay_seconds
+        self._retry_jitter_seconds = retry_jitter_seconds
+        self._rate_limit_cooldown_base_seconds = rate_limit_cooldown_base_seconds
+        self._rate_limit_cooldown_max_seconds = rate_limit_cooldown_max_seconds
+        self._rate_limit_cooldown_jitter_seconds = rate_limit_cooldown_jitter_seconds
+        self._global_rate_limit_cooldown_until: datetime | None = None
+        self._global_rate_limit_cooldown_count = 0
+        self._cooldown_lock = asyncio.Lock()
+
+    @staticmethod
+    def _classify_error_code(error: Exception) -> str:
+        if isinstance(error, RateLimitError):
+            return 'rate_limit'
+
+        error_text = str(error).lower()
+        if 'rate limit' in error_text or '429' in error_text:
+            return 'rate_limit'
+
+        return error.__class__.__name__.lower()
+
+    def _is_retriable_error(self, error: Exception) -> bool:
+        return self._classify_error_code(error) == 'rate_limit'
+
+    def _get_retry_delay_seconds(self, attempt_count: int) -> float:
+        base_delay = min(
+            self._retry_max_delay_seconds,
+            self._retry_base_delay_seconds * (2 ** max(attempt_count - 1, 0)),
+        )
+        if self._retry_jitter_seconds <= 0:
+            return base_delay
+        return base_delay + random.uniform(0, self._retry_jitter_seconds)
+
+    def _get_rate_limit_cooldown_seconds(self, cooldown_count: int) -> float:
+        base_delay = min(
+            self._rate_limit_cooldown_max_seconds,
+            self._rate_limit_cooldown_base_seconds * (2 ** max(cooldown_count - 1, 0)),
+        )
+        if self._rate_limit_cooldown_jitter_seconds <= 0:
+            return base_delay
+        return base_delay + random.uniform(0, self._rate_limit_cooldown_jitter_seconds)
+
+    async def _wait_for_global_rate_limit_cooldown(self) -> None:
+        while True:
+            async with self._cooldown_lock:
+                cooldown_until = self._global_rate_limit_cooldown_until
+
+            if cooldown_until is None:
+                return
+
+            remaining_seconds = (cooldown_until - datetime.now(timezone.utc)).total_seconds()
+            if remaining_seconds <= 0:
+                async with self._cooldown_lock:
+                    latest_cooldown_until = self._global_rate_limit_cooldown_until
+                    if (
+                        latest_cooldown_until is not None
+                        and (latest_cooldown_until - datetime.now(timezone.utc)).total_seconds()
+                        <= 0
+                    ):
+                        self._global_rate_limit_cooldown_until = None
+                        self._global_rate_limit_cooldown_count = 0
+                return
+
+            logger.warning(
+                'Global rate-limit cooldown active for %.2fs before processing next episode',
+                round(remaining_seconds, 2),
+            )
+            await asyncio.sleep(remaining_seconds)
+
+    async def _register_rate_limit_cooldown(self) -> tuple[datetime, float]:
+        async with self._cooldown_lock:
+            self._global_rate_limit_cooldown_count += 1
+            cooldown_delay = self._get_rate_limit_cooldown_seconds(
+                self._global_rate_limit_cooldown_count
+            )
+            now = datetime.now(timezone.utc)
+            cooldown_start = max(now, self._global_rate_limit_cooldown_until or now)
+            self._global_rate_limit_cooldown_until = cooldown_start + timedelta(
+                seconds=cooldown_delay
+            )
+            return self._global_rate_limit_cooldown_until, cooldown_delay
 
     async def add_episode_task(
         self,
@@ -100,34 +198,78 @@ class QueueService:
                 # Get the next episode processing function from the queue
                 # This will wait if the queue is empty
                 queued_task = await self._episode_queues[group_id].get()
-                process_func = queued_task.process_func
-                episode_uuid = queued_task.episode_uuid
-                pending_queue = self._pending_episode_uuids.get(group_id)
-                if pending_queue and pending_queue and pending_queue[0] == episode_uuid:
-                    pending_queue.popleft()
-                elif pending_queue and episode_uuid in pending_queue:
-                    pending_queue.remove(episode_uuid)
-
-                status = self._episode_statuses.get(episode_uuid)
-                if status is not None:
-                    status.state = 'processing'
-                    status.started_at = datetime.now(timezone.utc)
-                    status.queue_position = None
-
                 try:
-                    # Process the episode
-                    await process_func()
+                    process_func = queued_task.process_func
+                    episode_uuid = queued_task.episode_uuid
+                    pending_queue = self._pending_episode_uuids.get(group_id)
+                    if pending_queue and pending_queue[0] == episode_uuid:
+                        pending_queue.popleft()
+                    elif pending_queue and episode_uuid in pending_queue:
+                        pending_queue.remove(episode_uuid)
+
+                    status = self._episode_statuses.get(episode_uuid)
                     if status is not None:
-                        status.state = 'completed'
-                        status.processed_at = datetime.now(timezone.utc)
-                except Exception as e:
-                    if status is not None:
-                        status.state = 'failed'
-                        status.last_error = str(e)
-                        status.processed_at = datetime.now(timezone.utc)
-                    logger.error(
-                        f'Error processing queued episode for group_id {group_id}: {str(e)}'
-                    )
+                        status.queue_position = None
+                        status.next_retry_at = None
+
+                    while True:
+                        await self._wait_for_global_rate_limit_cooldown()
+
+                        if status is not None:
+                            status.state = 'processing'
+                            status.started_at = datetime.now(timezone.utc)
+                            status.attempt_count += 1
+
+                        try:
+                            await process_func()
+                            if status is not None:
+                                status.state = 'completed'
+                                status.processed_at = datetime.now(timezone.utc)
+                                status.next_retry_at = None
+                            break
+                        except Exception as e:
+                            error_code = self._classify_error_code(e)
+                            if status is not None:
+                                status.last_error = str(e)
+                                status.last_error_code = error_code
+
+                            if self._is_retriable_error(e):
+                                (
+                                    cooldown_until,
+                                    cooldown_delay,
+                                ) = await self._register_rate_limit_cooldown()
+
+                                if status is not None and status.attempt_count <= self._max_retries:
+                                    retry_delay = self._get_retry_delay_seconds(
+                                        status.attempt_count
+                                    )
+                                    retry_until = datetime.now(timezone.utc) + timedelta(
+                                        seconds=retry_delay
+                                    )
+                                    status.state = 'retrying'
+                                    status.next_retry_at = max(retry_until, cooldown_until)
+                                    logger.warning(
+                                        'Retrying queued episode %s for group_id %s after %ss '
+                                        '(attempt %s/%s, global cooldown %ss): %s',
+                                        episode_uuid,
+                                        group_id,
+                                        round(retry_delay, 2),
+                                        status.attempt_count,
+                                        status.attempt_count + self._max_retries,
+                                        round(cooldown_delay, 2),
+                                        e,
+                                    )
+                                    await asyncio.sleep(retry_delay)
+                                    continue
+
+                            if status is not None:
+                                status.state = 'failed'
+                                status.processed_at = datetime.now(timezone.utc)
+                                status.next_retry_at = None
+                            logger.error(
+                                f'Error processing queued episode for group_id {group_id}: {str(e)}'
+                            )
+                            break
                 finally:
                     # Mark the task as done regardless of success/failure
                     self._episode_queues[group_id].task_done()
