@@ -241,6 +241,13 @@ The `config.yaml` file supports environment variable expansion using `${VAR_NAME
 - `AZURE_OPENAI_API_VERSION`: Optional Azure OpenAI API version
 - `USE_AZURE_AD`: Optional use Azure Managed Identities for authentication
 - `SEMAPHORE_LIMIT`: Episode processing concurrency. See [Concurrency and LLM Provider 429 Rate Limit Errors](#concurrency-and-llm-provider-429-rate-limit-errors)
+- `GRAPHITI_MAX_RETRIES`: Retry budget for rate-limited ingest attempts (default: `2`)
+- `GRAPHITI_RETRY_BASE_DELAY_SECONDS`: Base per-episode retry delay in seconds (default: `5`)
+- `GRAPHITI_RETRY_MAX_DELAY_SECONDS`: Max per-episode retry delay in seconds (default: `60`)
+- `GRAPHITI_RETRY_JITTER_SECONDS`: Random retry jitter in seconds (default: `1`)
+- `GRAPHITI_RATE_LIMIT_COOLDOWN_BASE_SECONDS`: QueueService-wide cooldown after a 429 (default: `15`)
+- `GRAPHITI_RATE_LIMIT_COOLDOWN_MAX_SECONDS`: Max QueueService-wide cooldown in seconds (default: `180`)
+- `GRAPHITI_RATE_LIMIT_COOLDOWN_JITTER_SECONDS`: Random cooldown jitter in seconds (default: `3`)
 
 You can set these variables in a `.env` file in the project directory.
 
@@ -335,6 +342,9 @@ Graphiti's ingestion pipelines are designed for high concurrency, controlled by 
 
 **Default:** `SEMAPHORE_LIMIT=10` (suitable for OpenAI Tier 3, mid-tier Anthropic)
 
+If you are using an OpenAI-compatible or GLM-compatible upstream with unknown or relatively low RPM ceilings, start with
+`SEMAPHORE_LIMIT=1-2` and scale up only after repeated probe writes complete without `429` errors.
+
 #### Tuning Guidelines by LLM Provider
 
 **OpenAI:**
@@ -371,6 +381,38 @@ Set this in your `.env` file:
 ```bash
 SEMAPHORE_LIMIT=10  # Adjust based on your LLM provider tier
 ```
+
+### Queue Retry and Global Cooldown
+
+The MCP queue retries rate-limited episodes and now also applies a QueueService-wide cooldown after repeated `429`s so
+later queued groups do not immediately collide with the same upstream limit window. This cooldown applies to future
+dequeues/retries in the same MCP process; it does not cancel work that was already in flight before the first `429`.
+
+Example settings:
+
+```bash
+GRAPHITI_MAX_RETRIES=4
+GRAPHITI_RETRY_BASE_DELAY_SECONDS=15
+GRAPHITI_RETRY_MAX_DELAY_SECONDS=180
+GRAPHITI_RETRY_JITTER_SECONDS=3
+
+GRAPHITI_RATE_LIMIT_COOLDOWN_BASE_SECONDS=15
+GRAPHITI_RATE_LIMIT_COOLDOWN_MAX_SECONDS=180
+GRAPHITI_RATE_LIMIT_COOLDOWN_JITTER_SECONDS=3
+```
+
+Use higher retry/cooldown values when provider recovery windows are slow. Unparsable values fail fast during server
+startup instead of silently falling back.
+
+### 429 Recovery Playbook
+
+When you see repeated upstream `429` errors during `add_memory` / `get_ingest_status` flows:
+
+1. Lower `SEMAPHORE_LIMIT` first, usually to `1-2` for unknown or low ceilings.
+2. Split the embedder away from the LLM upstream so embeddings do not consume the same quota budget.
+3. Increase the queue retry and cooldown settings above if the provider needs a longer recovery window.
+4. Rebuild/restart the MCP service.
+5. Validate with a single lightweight probe episode before resuming bulk or interactive writes.
 
 ### Docker Deployment
 

@@ -322,7 +322,19 @@ CLI 参数 > 环境变量 > YAML 配置 > 默认值
 
 ### 7.1 `.env.nas` 推荐起点
 
-对 NAS / 外部 Neo4j / GLM + Ollama 这条链路，推荐从下面开始：
+对 NAS / 外部 Neo4j / GLM + Ollama 这条链路，推荐从下面开始。
+
+如果你面对的是 **RPM 上限未知**、**GLM/OpenAI-compatible 代理层**、或者已经观测到 `429` 的上游，不要直接从 `10` 开始，先用：
+
+```bash
+SEMAPHORE_LIMIT=1
+# 或者
+SEMAPHORE_LIMIT=2
+```
+
+只有在单条探针写入稳定完成、日志里没有重复 `429` 的前提下，再逐步加大并发。
+
+一个较高配额的参考起点如下：
 
 ```bash
 MCP_PORT=8011
@@ -366,6 +378,36 @@ docker compose -f docker/docker-compose-neo4j-external.yml up -d --build
 ```
 
 不要再直接改 compose YAML。
+
+### 7.3 队列重试与全局 cooldown
+
+当前 `graphiti-mcp` 队列除了单 episode retry，还支持 **QueueService 级别的全局 cooldown**：
+
+- 某个 group 的 episode 命中 `429`
+- 不只是这个 episode 重试等待
+- 同一 MCP 进程里其他 group 的后续任务也会先等待 cooldown 窗口过去
+- 但已经在飞的请求不会被中途取消
+
+建议放进 `.env.nas` 的参数：
+
+```bash
+GRAPHITI_MAX_RETRIES=4
+GRAPHITI_RETRY_BASE_DELAY_SECONDS=15
+GRAPHITI_RETRY_MAX_DELAY_SECONDS=180
+GRAPHITI_RETRY_JITTER_SECONDS=3
+
+GRAPHITI_RATE_LIMIT_COOLDOWN_BASE_SECONDS=15
+GRAPHITI_RATE_LIMIT_COOLDOWN_MAX_SECONDS=180
+GRAPHITI_RATE_LIMIT_COOLDOWN_JITTER_SECONDS=3
+```
+
+含义：
+
+- `GRAPHITI_MAX_RETRIES`: 单 episode 的重试次数
+- `GRAPHITI_RETRY_*`: 单 episode 的指数退避参数
+- `GRAPHITI_RATE_LIMIT_COOLDOWN_*`: 整个 QueueService 在重复 `429` 后的全局降载窗口
+
+这些变量如果填了无法解析的值，服务会在启动阶段直接失败，而不是静默回退。
 
 ## 8. 启动后怎么验证
 
@@ -446,6 +488,17 @@ uv run main.py --transport stdio
 2. Graphiti 后台处理 episode
 3. 抽实体、去重、抽关系、摘要、embedding
 4. 最后才变成可检索
+
+### 10.1.1 遇到重复 `429` 时怎么处理
+
+推荐按这个顺序处理，不要一上来就反复重试相同写入：
+
+1. 先把 `SEMAPHORE_LIMIT` 降到 `1-2`
+2. 尽量把 embedder 从 LLM 提供商预算里拆出去
+3. 调大 `GRAPHITI_RETRY_*` 和 `GRAPHITI_RATE_LIMIT_COOLDOWN_*`
+4. 重建/重启服务
+5. 只用一条轻量 probe episode 验证
+6. 等 `get_ingest_status == completed` 后再恢复正常流量
 
 ### 10.2 当前慢点通常在 LLM，不在 embedder
 
